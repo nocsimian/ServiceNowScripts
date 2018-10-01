@@ -1,0 +1,14 @@
+var userUtils = Class.create();
+userUtils.prototype = Object.extendsObject(AbstractAjaxProcessor, {
+
+	getDepartment: function(){
+	var userrecord = new GlideRecord('cmn_department');
+		userrecord.get(this.getParameter('sysparm_userID'));
+		gs.info(userrecord.name);
+		return userrecord.name;
+		
+		
+	},
+	
+    type: 'userUtils'
+});
