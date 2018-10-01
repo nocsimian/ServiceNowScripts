@@ -1,0 +1,32 @@
+function onLoad() {
+	//Testing to see if fields need filled
+	var nullchecktitle = g_form.getValue('u_requestedfortitle');
+	var nullcheckdepartment = g_form.getValue('u_requestedfordepartment');
+	if (nullchecktitle != '' && nullcheckdepartment !='') {
+		//alert("Both fields have data");
+		return;
+	}
+	
+	var requestedfor = g_form.getReference('request_item.request.requested_for') ;
+	//alert(requestedfor.department + "  "+ requestedfor.title);
+
+	var ga = new GlideAjax('userUtils');
+	ga.addParam('sysparm_name', 'getDepartment');
+	ga.addParam('sysparm_userID', requestedfor.department);
+	
+	ga.getXML(Results);
+	
+	
+	function Results(response) {
+	      var answer = response.responseXML.documentElement.getAttribute("answer"); 
+    alert(answer);
+		g_form.setValue('u_requestedfordepartment',answer);
+		g_form.setValue('u_requestedfortitle', requestedfor.title);
+		
+       
+}
+	
+	
+	
+
+}
