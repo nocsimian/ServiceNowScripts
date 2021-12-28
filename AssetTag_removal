@@ -1,0 +1,10 @@
+var gr = new GlideRecord('cmdb_ci_hardware');
+  gr.addEncodedQuery('asset_tagSAMEASname');
+  gr.query();
+
+while(gr.next()){
+	gr.asset_tag = "";
+	gr.update();
+  gs.log(gr.asset_tag);
+
+}
