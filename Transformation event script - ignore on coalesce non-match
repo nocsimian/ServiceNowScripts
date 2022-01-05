@@ -1,0 +1,5 @@
+if (action == 'insert') 
+  ignore = true;
+  
+ //add to on Before script
+  
