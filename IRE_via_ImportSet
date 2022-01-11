@@ -1,0 +1,19 @@
+//onBefore transform script.
+//Calls IRE to prevent duplicate CIs
+
+
+(function runTransformScript(source, map, log, target) {
+// Call CMDB API to do Identification and Reconciliation of current row
+var cmdbUtil = new CMDBTransformUtil();
+cmdbUtil.identifyAndReconcile(source, map, log);
+ignore = true;
+
+if (cmdbUtil.hasError()) {
+        var errorMessage = cmdbUtil.getError();
+        log.error(errorMessage);
+} else {
+        log.info('IE Output Payload: ' + cmdbUtil.getOutputPayload());
+        log.info('Imported CI: ' + cmdbUtil.getOutputRecordSysId());
+}
+
+})(source, map, log, target);
