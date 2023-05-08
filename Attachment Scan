@@ -1,0 +1,14 @@
+var grAttachment = new GlideRecord('sys_attachment');
+var numsum = 0;
+grAttachment.query();
+while (grAttachment.next()){
+    if (grAttachment.getValue('compressed') === 'true') {
+        numsum = numsum + parseInt(grAttachment.size_compressed.getValue(), 10);
+    }
+    else {
+        numsum = numsum + parseInt(grAttachment.size_bytes.getValue(), 10);
+    }
+}
+var numGB = Math.round(numsum / 1024 /1024 /1024 * 100) /100;
+
+gs.info('Overall size is ' + numGB + 'GB');
