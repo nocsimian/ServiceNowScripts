@@ -1,0 +1,3 @@
+https://<site>.service-now.com/<table>_list.do?CSV&sysparm_query=sys_id%3E%3D89c062eec5f3700031d35fbc32a52f5c&sysparm_orderby=sys_id&sysparm_record_count=40000
+
+//sysparm_query=sys_id%3E%3D to break up large extracts and resume by the sysid you stopped at
