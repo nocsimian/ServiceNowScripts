@@ -1,0 +1,11 @@
+var gr = new GlideRecord('alm_asset');
+  gr.addEncodedQuery('model.manufacturer=67df42c787b56d104dcb4087dabb35bc');
+  gr.query();
+
+while(gr.next()){
+	var a = new AssetandCI();
+	a.deleteAssetOnly(gr);
+  gs.log(gr.display_name);
+
+}
+
