@@ -1,0 +1,229 @@
+/**
+ * ServiceNow Background Script: Generate Demo Outage Records
+ *
+ * Purpose: Creates 5 outage records per CI in the target list.
+ *            - 3 outages closed within the past 7 days
+ *            - 2 outages currently open (no end date)
+ *          All durations are randomised.
+ *
+ * Instructions:
+ *   1. Navigate to System Definition > Scripts - Background
+ *   2. Paste this script and click "Run script"
+ *   3. Adjust CONFIG values if needed before running
+ *
+ * Compatible with: ServiceNow Rome / San Diego / Tokyo / Utah / Vancouver+
+ */
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
+var CONFIG = {
+    dryRun:     false,   // true = log only, no DB inserts
+    logResults: true,    // print each record to the system log
+    ciTable:    'cmdb_ci' // table to look up CIs in
+};
+
+// ─────────────────────────────────────────────────────────────
+// TARGET CI LIST  (matched on the 'name' field in cmdb_ci)
+// ─────────────────────────────────────────────────────────────
+var CI_NAMES = [
+    'Amazon Web Services',
+    'WelcoMe AU',
+	'My World NZ',
+	'Okta - Global Prod',
+	'Azure Cloud',
+	'Sabre'
+];
+
+// ─────────────────────────────────────────────────────────────
+// OUTAGE CAUSES / TYPES  (used to vary record content)
+// ─────────────────────────────────────────────────────────────
+var OUTAGE_TYPES = [
+    { type: 'unplanned', cause: 'Hardware failure',            desc: 'Unexpected hardware component failure caused service disruption.' },
+    { type: 'unplanned', cause: 'Network connectivity loss',   desc: 'Loss of network connectivity resulted in service unavailability.' },
+    { type: 'unplanned', cause: 'Software defect',             desc: 'Critical software defect triggered an unplanned service outage.' },
+    { type: 'unplanned', cause: 'Power failure',               desc: 'Power supply failure caused unexpected downtime.' },
+    { type: 'unplanned', cause: 'Database corruption',         desc: 'Database corruption detected; service halted to prevent data loss.' },
+    { type: 'planned',   cause: 'Scheduled maintenance',       desc: 'Planned maintenance window for patching and system updates.' },
+    { type: 'planned',   cause: 'Infrastructure upgrade',      desc: 'Scheduled infrastructure upgrade requiring service downtime.' },
+    { type: 'planned',   cause: 'Capacity expansion',          desc: 'Planned capacity expansion activity requiring brief downtime.' },
+    { type: 'unplanned', cause: 'Third-party provider outage', desc: 'Upstream third-party provider experienced an outage affecting this service.' },
+    { type: 'unplanned', cause: 'Security incident response',  desc: 'Service taken offline as a precautionary measure during security incident investigation.' }
+];
+
+// ─────────────────────────────────────────────────────────────
+// HELPER UTILITIES
+// ─────────────────────────────────────────────────────────────
+
+/** Pick a random element from an array */
+function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/** Random integer between min and max (inclusive) */
+function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Build a CLOSED outage that ended sometime in the past 7 days.
+ * - End time  : between now and 7 days ago  (random)
+ * - Duration  : 15 min – 8 hours            (random, subtracted back from end)
+ * - Start time: end minus duration
+ */
+function buildClosedOutage() {
+    var now        = new GlideDateTime();
+    var sevenDays  = 7 * 24 * 60 * 60 * 1000;   // ms
+
+    // Random end time within the past 7 days
+    var endOffset  = Math.floor(Math.random() * sevenDays);   // ms ago
+    var endMs      = now.getNumericValue() - endOffset;
+
+    // Random duration: 15 min – 8 hours (in ms)
+    var durationMs = randInt(15, 480) * 60 * 1000;
+
+    var startMs    = endMs - durationMs;
+
+    var begin = new GlideDateTime();
+    begin.setNumericValue(startMs);
+
+    var end = new GlideDateTime();
+    end.setNumericValue(endMs);
+
+    return { begin: begin, end: end, durationMs: durationMs };
+}
+
+/**
+ * Build a CURRENTLY OPEN outage.
+ * - Start time: between 10 minutes and 72 hours ago (random)
+ * - End time  : empty / null
+ */
+function buildOpenOutage() {
+    var now       = new GlideDateTime();
+    var maxAgoMs  = 72 * 60 * 60 * 1000;   // 72 hours
+    var minAgoMs  = 10 * 60 * 1000;         // 10 minutes
+
+    var startOffset = randInt(minAgoMs, maxAgoMs);
+    var startMs     = now.getNumericValue() - startOffset;
+
+    var begin = new GlideDateTime();
+    begin.setNumericValue(startMs);
+
+    return { begin: begin, end: null, durationMs: startOffset };
+}
+
+/** Format milliseconds as a human-readable string for logging */
+function fmtDuration(ms) {
+    var totalMin = Math.floor(ms / 60000);
+    var hrs      = Math.floor(totalMin / 60);
+    var mins     = totalMin % 60;
+    return (hrs > 0 ? hrs + 'h ' : '') + mins + 'm';
+}
+
+// ─────────────────────────────────────────────────────────────
+// LOOK UP CIs
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Returns a map of { ciName -> sys_id } for all found CIs.
+ * Logs a warning for any names not found.
+ */
+function resolveCIs(nameList) {
+    var resolved = {};
+    for (var i = 0; i < nameList.length; i++) {
+        var ciName = nameList[i];
+        var gr = new GlideRecord(CONFIG.ciTable);
+        gr.addQuery('name', ciName);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            resolved[ciName] = gr.getUniqueValue();
+            gs.log('CI found: "' + ciName + '" → sys_id ' + resolved[ciName], 'DemoOutageGen');
+        } else {
+            gs.logWarning('CI NOT FOUND: "' + ciName + '" in table ' + CONFIG.ciTable + ' — skipping.', 'DemoOutageGen');
+        }
+    }
+    return resolved;
+}
+
+// ─────────────────────────────────────────────────────────────
+// INSERT ONE OUTAGE RECORD
+// ─────────────────────────────────────────────────────────────
+
+function insertOutage(ciSysId, ciName, timings, isOpen, outageTypeObj, outageIndex) {
+    var statusLabel = isOpen ? 'OPEN  ' : 'CLOSED';
+
+    if (CONFIG.logResults) {
+        gs.log(
+            '  [' + (outageIndex + 1) + '] ' + statusLabel +
+            ' | ' + outageTypeObj.type.toUpperCase() +
+            ' | Cause: ' + outageTypeObj.cause +
+            ' | Start: ' + timings.begin +
+            (isOpen ? ' | End: (open)' : ' | End: ' + timings.end) +
+            ' | Duration: ' + fmtDuration(timings.durationMs),
+            'DemoOutageGen'
+        );
+    }
+
+    if (CONFIG.dryRun) { return true; }
+
+    try {
+        var gr = new GlideRecord('cmdb_ci_outage');
+        gr.initialize();
+        gr.setValue('ci',         ciSysId);
+        gr.setValue('type',       outageTypeObj.type);      // 'planned' | 'unplanned'
+        gr.setValue('cause',      outageTypeObj.cause);
+        gr.setValue('notes',      outageTypeObj.desc);
+        gr.setValue('begin',      timings.begin);
+
+        if (!isOpen && timings.end) {
+            gr.setValue('end', timings.end);
+        }
+
+        gr.insert();
+        return true;
+    } catch (ex) {
+        gs.logError('Failed to insert outage for "' + ciName + '": ' + ex.message, 'DemoOutageGen');
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+
+gs.log('=== Demo Outage Generator START (' +
+    (CONFIG.dryRun ? 'DRY RUN' : 'LIVE') + ') ===', 'DemoOutageGen');
+
+var ciMap       = resolveCIs(CI_NAMES);
+var totalInsert = 0;
+var totalSkip   = 0;
+var totalError  = 0;
+
+for (var ciName in ciMap) {
+    var ciSysId = ciMap[ciName];
+    gs.log('--- Generating outages for: "' + ciName + '" ---', 'DemoOutageGen');
+
+    // ── 3 CLOSED outages (past 7 days) ──────────────────────
+    for (var c = 0; c < 3; c++) {
+        var closedTimings = buildClosedOutage();
+        var closedType    = pick(OUTAGE_TYPES);
+        var ok = insertOutage(ciSysId, ciName, closedTimings, false, closedType, c);
+        if (CONFIG.dryRun) { totalSkip++; } else if (ok) { totalInsert++; } else { totalError++; }
+    }
+
+    // ── 2 OPEN outages (currently active) ───────────────────
+    for (var o = 0; o < 2; o++) {
+        var openTimings = buildOpenOutage();
+        var openType    = pick(OUTAGE_TYPES);
+        var ok2 = insertOutage(ciSysId, ciName, openTimings, true, openType, o + 3);
+        if (CONFIG.dryRun) { totalSkip++; } else if (ok2) { totalInsert++; } else { totalError++; }
+    }
+}
+
+// ── Summary ──────────────────────────────────────────────────
+gs.log('=== Demo Outage Generator COMPLETE ===', 'DemoOutageGen');
+gs.log('CIs processed : ' + Object.keys(ciMap).length + ' of ' + CI_NAMES.length, 'DemoOutageGen');
+gs.log('Records inserted : ' + totalInsert, 'DemoOutageGen');
+gs.log('Records skipped  : ' + totalSkip + (CONFIG.dryRun ? ' (dry run)' : ''), 'DemoOutageGen');
+gs.log('Errors           : ' + totalError, 'DemoOutageGen');
