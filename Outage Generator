@@ -170,7 +170,7 @@ function insertOutage(ciSysId, ciName, timings, isOpen, outageTypeObj, outageInd
     try {
         var gr = new GlideRecord('cmdb_ci_outage');
         gr.initialize();
-        gr.setValue('ci',         ciSysId);
+        gr.setValue('cmdb_ci',         ciSysId);
         gr.setValue('type',       outageTypeObj.type);      // 'planned' | 'unplanned'
         gr.setValue('cause',      outageTypeObj.cause);
         gr.setValue('notes',      outageTypeObj.desc);
