@@ -1,0 +1,364 @@
+/**
+ * ServiceNow Background Script: Generate Demo Change Records
+ *
+ * Purpose: Creates 5 change_request records per CI in the target list,
+ *          distributed across 4 lifecycle states:
+ *
+ *   [1]  New / Draft          — state: -5   (just created, not yet submitted)
+ *   [2]  Assess / Authorize   — state:  -4  (under review / awaiting approval)
+ *   [3]  Implement (In Prog.) — state:   2  (approved, work underway right now)
+ *   [4]  Closed / Complete    — state:   3  (work finished, record closed)
+ *   [5]  Closed / Complete    — state:   3  (second closed change for history depth)
+ *
+ *   Timestamps are generated so each state has contextually realistic dates.
+ *
+ * Instructions:
+ *   1. Navigate to System Definition > Scripts - Background
+ *   2. Paste this script and click "Run script"
+ *   3. Adjust CONFIG values if needed before running
+ *
+ * Compatible with: ServiceNow Rome / San Diego / Tokyo / Utah / Vancouver+
+ *
+ * NOTE: ServiceNow Change state integer values (OOTB):
+ *   -5 = New          -4 = Assess       -3 = Authorize
+ *   -2 = Scheduled     2 = Implement      3 = Review
+ *    0 = Closed         4 = Canceled
+ *   "Closed Complete" uses close_code = 'successful' with state = 0
+ */
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
+var CONFIG = {
+    dryRun:     false,    // true = log only, no DB inserts
+    logResults: true,     // print each record to the system log
+    ciTable:    'cmdb_ci' // table to look up CIs in
+};
+
+// ─────────────────────────────────────────────────────────────
+// TARGET CI LIST  (matched on the 'name' field in cmdb_ci)
+// ─────────────────────────────────────────────────────────────
+var CI_NAMES = [
+    'Amazon Web Services',
+    'WelcoMe AU'
+];
+
+// ─────────────────────────────────────────────────────────────
+// CHANGE STATE DEFINITIONS
+// 5 slots per CI — one assigned state each
+// ─────────────────────────────────────────────────────────────
+var CHANGE_STATES = [
+    {
+        label:      'New / Draft',
+        state:      '-5',
+        closeCode:  null,
+        closeNotes: null
+    },
+    {
+        label:      'Assess / Authorize',
+        state:      '-4',
+        closeCode:  null,
+        closeNotes: null
+    },
+    {
+        label:      'Implement (In Progress)',
+        state:      '2',
+        closeCode:  null,
+        closeNotes: null
+    },
+    {
+        label:      'Closed / Complete',
+        state:      '0',
+        closeCode:  'successful',
+        closeNotes: 'Change implemented successfully. All tasks completed and verified.'
+    },
+    {
+        label:      'Closed / Complete',
+        state:      '0',
+        closeCode:  'successful_issues',
+        closeNotes: 'Change completed with minor issues noted. Post-implementation review scheduled.'
+    }
+];
+
+// ─────────────────────────────────────────────────────────────
+// CHANGE TEMPLATES  (short description / description / category)
+// ─────────────────────────────────────────────────────────────
+var CHANGE_TEMPLATES = [
+    {
+        category:    'Software',
+        type:        'normal',
+        shortDesc:   'Apply security patches to {ci}',
+        description: 'Apply latest OS and application security patches to {ci} to address CVEs identified in the monthly vulnerability scan. Maintenance window required.'
+    },
+    {
+        category:    'Software',
+        type:        'normal',
+        shortDesc:   'Upgrade {ci} to latest supported version',
+        description: 'Upgrade {ci} platform components to the latest stable release. Includes pre-upgrade backup, upgrade execution, smoke testing, and rollback plan.'
+    },
+    {
+        category:    'Hardware',
+        type:        'normal',
+        shortDesc:   'Increase compute capacity for {ci}',
+        description: 'Provision additional compute resources for {ci} to address growing demand. Capacity planning review completed and approved by architecture board.'
+    },
+    {
+        category:    'Network',
+        type:        'normal',
+        shortDesc:   'Update firewall rules for {ci}',
+        description: 'Modify ingress and egress firewall rules for {ci} as requested by the security team following the annual access review. Testing to be performed in staging first.'
+    },
+    {
+        category:    'Software',
+        type:        'standard',
+        shortDesc:   'Deploy configuration changes to {ci}',
+        description: 'Push approved configuration parameter updates to {ci}. Changes reviewed and signed off by the platform owner. Expected impact: minimal (< 5 min restart).'
+    },
+    {
+        category:    'Software',
+        type:        'normal',
+        shortDesc:   'Integrate {ci} with new monitoring platform',
+        description: 'Install and configure monitoring agents on {ci} to connect to the new observability platform. Includes validation of dashboards and alerting thresholds post-install.'
+    },
+    {
+        category:    'Hardware',
+        type:        'emergency',
+        shortDesc:   'Replace failing storage component on {ci}',
+        description: 'Emergency replacement of a degraded storage component on {ci} identified by predictive monitoring. Risk of data loss if not addressed within 48 hours.'
+    },
+    {
+        category:    'Software',
+        type:        'normal',
+        shortDesc:   'Migrate {ci} to updated infrastructure',
+        description: 'Planned migration of {ci} workloads to refreshed infrastructure. Migration plan approved; rollback capability confirmed. Comms sent to stakeholders.'
+    },
+    {
+        category:    'Network',
+        type:        'standard',
+        shortDesc:   'SSL certificate renewal for {ci}',
+        description: 'Renew expiring SSL/TLS certificates for {ci} services. New certificates generated, validated, and staged for deployment. Zero-downtime rotation planned.'
+    },
+    {
+        category:    'Software',
+        type:        'normal',
+        shortDesc:   'Performance tuning and optimisation for {ci}',
+        description: 'Apply performance tuning recommendations for {ci} based on analysis of recent monitoring data. Changes include query optimisation, cache configuration, and connection pool tuning.'
+    }
+];
+
+// ─────────────────────────────────────────────────────────────
+// RISK / PRIORITY / IMPACT  (randomly assigned)
+// ─────────────────────────────────────────────────────────────
+var RISKS      = ['1', '2', '3', '4'];   // 1=Critical 2=High 3=Moderate 4=Low
+var PRIORITIES = ['1', '2', '3', '4'];   // 1=Critical 2=High 3=Moderate 4=Low
+var IMPACTS    = ['1', '2', '3'];        // 1=High 2=Medium 3=Low
+
+// ─────────────────────────────────────────────────────────────
+// HELPER UTILITIES
+// ─────────────────────────────────────────────────────────────
+
+function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/** Return a GlideDateTime offset by +/- ms from now */
+function offsetNow(offsetMs) {
+    var gdt = new GlideDateTime();
+    gdt.setNumericValue(gdt.getNumericValue() + offsetMs);
+    return gdt;
+}
+
+/** Build contextually correct timestamps for each state */
+function buildTimings(stateObj) {
+    var now      = new GlideDateTime().getNumericValue();
+    var minMs    = 60 * 1000;
+    var hrMs     = 60 * minMs;
+    var dayMs    = 24 * hrMs;
+    var t        = {};
+
+    if (stateObj.state === '-5') {
+        // New: created recently, no planned dates yet
+        t.opened    = offsetNow(-randInt(1 * hrMs,  12 * hrMs));
+        t.planned_s = offsetNow( randInt(3 * dayMs, 14 * dayMs));   // future window
+        t.planned_e = new GlideDateTime(t.planned_s);
+        t.planned_e.setNumericValue(t.planned_s.getNumericValue() + randInt(1 * hrMs, 4 * hrMs));
+        t.start_date = null;
+        t.end_date   = null;
+        t.closed     = null;
+
+    } else if (stateObj.state === '-4') {
+        // Assess: created 1-3 days ago, planned window is upcoming
+        t.opened    = offsetNow(-randInt(1 * dayMs, 3 * dayMs));
+        t.planned_s = offsetNow( randInt(2 * dayMs, 10 * dayMs));
+        t.planned_e = new GlideDateTime(t.planned_s);
+        t.planned_e.setNumericValue(t.planned_s.getNumericValue() + randInt(1 * hrMs, 4 * hrMs));
+        t.start_date = null;
+        t.end_date   = null;
+        t.closed     = null;
+
+    } else if (stateObj.state === '2') {
+        // Implement: started between 30min and 6hrs ago, window ends in future
+        t.opened    = offsetNow(-randInt(1 * dayMs,  5 * dayMs));
+        t.planned_s = offsetNow(-randInt(30 * minMs, 6 * hrMs));
+        t.planned_e = offsetNow( randInt(1 * hrMs,   4 * hrMs));
+        t.start_date = new GlideDateTime(t.planned_s);
+        t.end_date   = null;
+        t.closed     = null;
+
+    } else {
+        // Closed (state 0): all in the past, closed 0-7 days ago
+        var closeAgo = randInt(0, 7 * dayMs);
+        var duration = randInt(1 * hrMs, 8 * hrMs);
+        t.closed     = offsetNow(-closeAgo);
+        t.planned_e  = new GlideDateTime(t.closed);
+        t.planned_s  = offsetNow(-(closeAgo + duration));
+        t.opened     = offsetNow(-(closeAgo + duration + randInt(1 * dayMs, 5 * dayMs)));
+        t.start_date = new GlideDateTime(t.planned_s);
+        t.end_date   = new GlideDateTime(t.closed);
+    }
+
+    return t;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LOOK UP CIs
+// ─────────────────────────────────────────────────────────────
+
+function resolveCIs(nameList) {
+    var resolved = {};
+    for (var i = 0; i < nameList.length; i++) {
+        var ciName = nameList[i];
+        var gr = new GlideRecord(CONFIG.ciTable);
+        gr.addQuery('name', ciName);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            resolved[ciName] = gr.getUniqueValue();
+            gs.log('CI found: "' + ciName + '" → sys_id ' + resolved[ciName], 'DemoChangeGen');
+        } else {
+            gs.logWarning('CI NOT FOUND: "' + ciName + '" in table ' + CONFIG.ciTable + ' — skipping.', 'DemoChangeGen');
+        }
+    }
+    return resolved;
+}
+
+// ─────────────────────────────────────────────────────────────
+// INSERT ONE CHANGE RECORD
+// ─────────────────────────────────────────────────────────────
+
+function insertChange(ciSysId, ciName, stateObj, tmpl, idx) {
+
+    var timings     = buildTimings(stateObj);
+    var shortDesc   = tmpl.shortDesc.replace(/\{ci\}/g, ciName);
+    var description = tmpl.description.replace(/\{ci\}/g, ciName);
+    var risk        = pick(RISKS);
+    var priority    = pick(PRIORITIES);
+    var impact      = pick(IMPACTS);
+
+    if (CONFIG.logResults) {
+        gs.log(
+            '  [' + (idx + 1) + '] ' + stateObj.label +
+            ' (state ' + stateObj.state + ')' +
+            ' | ' + tmpl.type.toUpperCase() +
+            ' | Cat: ' + tmpl.category +
+            ' | Risk: ' + risk +
+            ' | "' + shortDesc + '"',
+            'DemoChangeGen'
+        );
+    }
+
+    if (CONFIG.dryRun) { return true; }
+
+    try {
+        var gr = new GlideRecord('change_request');
+        gr.initialize();
+
+        // Core fields
+        gr.setValue('cmdb_ci',          ciSysId);
+        gr.setValue('state',            stateObj.state);
+        gr.setValue('type',             tmpl.type);
+        gr.setValue('category',         tmpl.category);
+        gr.setValue('short_description', shortDesc);
+        gr.setValue('description',      description);
+        gr.setValue('risk',             risk);
+        gr.setValue('priority',         priority);
+        gr.setValue('impact',           impact);
+
+        // Timestamps
+        gr.setValue('sys_created_on',   timings.opened);
+        gr.setValue('opened_at',        timings.opened);
+        gr.setValue('start_date',       timings.planned_s);
+        gr.setValue('end_date',         timings.planned_e);
+
+        if (timings.start_date) {
+            gr.setValue('work_start', timings.start_date);
+        }
+        if (timings.end_date) {
+            gr.setValue('work_end', timings.end_date);
+        }
+
+        // Closure fields (only for closed records)
+        if (stateObj.closeCode) {
+            gr.setValue('close_code',  stateObj.closeCode);
+            gr.setValue('close_notes', stateObj.closeNotes);
+            gr.setValue('closed_at',   timings.closed);
+        }
+
+        gr.insert();
+        return true;
+
+    } catch (ex) {
+        gs.logError('Failed to insert change for "' + ciName + '": ' + ex.message, 'DemoChangeGen');
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+
+gs.log('=== Demo Change Generator START (' +
+    (CONFIG.dryRun ? 'DRY RUN' : 'LIVE') + ') ===', 'DemoChangeGen');
+
+var ciMap       = resolveCIs(CI_NAMES);
+var totalInsert = 0;
+var totalSkip   = 0;
+var totalError  = 0;
+
+// Shuffle a copy of templates so each CI gets varied records
+function shuffled(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+}
+
+for (var ciName in ciMap) {
+    var ciSysId   = ciMap[ciName];
+    var templates = shuffled(CHANGE_TEMPLATES);
+
+    gs.log('--- Generating change records for: "' + ciName + '" ---', 'DemoChangeGen');
+
+    for (var s = 0; s < CHANGE_STATES.length; s++) {
+        var stateObj = CHANGE_STATES[s];
+        var tmpl     = templates[s % templates.length];
+        var ok       = insertChange(ciSysId, ciName, stateObj, tmpl, s);
+
+        if (CONFIG.dryRun) { totalSkip++; }
+        else if (ok)        { totalInsert++; }
+        else                { totalError++; }
+    }
+}
+
+// ── Summary ──────────────────────────────────────────────────
+gs.log('=== Demo Change Generator COMPLETE ===', 'DemoChangeGen');
+gs.log('CIs processed    : ' + Object.keys(ciMap).length + ' of ' + CI_NAMES.length, 'DemoChangeGen');
+gs.log('Records inserted : ' + totalInsert, 'DemoChangeGen');
+gs.log('Records skipped  : ' + totalSkip + (CONFIG.dryRun ? ' (dry run)' : ''), 'DemoChangeGen');
+gs.log('Errors           : ' + totalError, 'DemoChangeGen');
