@@ -1,0 +1,405 @@
+/**
+ * ServiceNow Background Script: Generate Demo Incident Records
+ *
+ * Purpose: Creates 5 incident records per CI in the target list,
+ *          distributed across 4 states, with at least 1 Critical
+ *          priority incident guaranteed per CI.
+ *
+ *   Slot distribution (5 per CI):
+ *   [1]  New           — state: 1  | priority: 1 (Critical) GUARANTEED
+ *   [2]  In Progress   — state: 2  | random priority 2-3
+ *   [3]  In Progress   — state: 2  | random priority 2-4
+ *   [4]  On Hold       — state: 3  | random priority 3-4
+ *   [5]  Resolved      — state: 6  | random priority 2-4
+ *
+ * Instructions:
+ *   1. Navigate to System Definition > Scripts - Background
+ *   2. Paste this script and click "Run script"
+ *   3. Adjust CONFIG values if needed before running
+ *
+ * Compatible with: ServiceNow Rome / San Diego / Tokyo / Utah / Vancouver+
+ *
+ * ServiceNow Incident state values (OOTB):
+ *   1 = New   2 = In Progress   3 = On Hold
+ *   6 = Resolved   7 = Closed
+ *
+ * Priority values:
+ *   1 = Critical   2 = High   3 = Moderate   4 = Low
+ *
+ * Hold reason values:
+ *   1 = Awaiting Caller   2 = Awaiting Change   3 = Awaiting Problem   5 = Awaiting Vendor
+ */
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
+var CONFIG = {
+    dryRun:     false,     // true = log only, no DB inserts
+    logResults: true,      // print each record to the system log
+    ciTable:    'cmdb_ci'  // table to look up CIs in
+};
+
+// ─────────────────────────────────────────────────────────────
+// TARGET CI LIST  (matched on the 'name' field in cmdb_ci)
+// ─────────────────────────────────────────────────────────────
+var CI_NAMES = [
+    'Amazon Web Services',
+    'WelcoMe AU'
+];
+
+// ─────────────────────────────────────────────────────────────
+// INCIDENT SLOT DEFINITIONS
+// Exactly 5 slots — state, priority pool, and hold reason per slot
+// ─────────────────────────────────────────────────────────────
+var INCIDENT_SLOTS = [
+    {
+        label:        'New (Critical)',
+        state:        '1',
+        priority:     '1',          // Forced Critical
+        holdReason:   null,
+        resolvedAt:   false
+    },
+    {
+        label:        'In Progress (High)',
+        state:        '2',
+        priority:     null,         // randomly assigned from pool below
+        priorityPool: ['2', '2', '3'],
+        holdReason:   null,
+        resolvedAt:   false
+    },
+    {
+        label:        'In Progress',
+        state:        '2',
+        priority:     null,
+        priorityPool: ['2', '3', '4'],
+        holdReason:   null,
+        resolvedAt:   false
+    },
+    {
+        label:        'On Hold',
+        state:        '3',
+        priority:     null,
+        priorityPool: ['2', '3', '3', '4'],
+        holdReason:   null,         // assigned randomly below
+        resolvedAt:   false
+    },
+    {
+        label:        'Resolved',
+        state:        '6',
+        priority:     null,
+        priorityPool: ['2', '3', '4'],
+        holdReason:   null,
+        resolvedAt:   true
+    }
+];
+
+var HOLD_REASONS = ['1', '2', '3', '5'];  // Awaiting Caller/Change/Problem/Vendor
+
+// ─────────────────────────────────────────────────────────────
+// INCIDENT TEMPLATES
+// ─────────────────────────────────────────────────────────────
+var INCIDENT_TEMPLATES = [
+    // Critical / P1 worthy
+    {
+        category:    'Software',
+        subcategory: 'Application',
+        shortDesc:   '{ci} — Complete service outage impacting all users',
+        description: '{ci} is completely unavailable. All users are unable to access the service. Initial triage underway; no ETA for restoration. Bridge call active.',
+        impact:      '1',
+        urgency:     '1'
+    },
+    {
+        category:    'Network',
+        subcategory: 'Connectivity',
+        shortDesc:   '{ci} — Total loss of network connectivity',
+        description: 'All network connectivity to {ci} has been lost. Both primary and secondary links are down. NOC engaged; ISP ticket raised.',
+        impact:      '1',
+        urgency:     '1'
+    },
+    {
+        category:    'Hardware',
+        subcategory: 'Storage',
+        shortDesc:   '{ci} — Critical storage failure detected',
+        description: 'Critical storage subsystem failure detected on {ci}. Data at risk. Emergency response team engaged. Backup verification in progress.',
+        impact:      '1',
+        urgency:     '1'
+    },
+
+    // High / P2
+    {
+        category:    'Software',
+        subcategory: 'Application',
+        shortDesc:   '{ci} — Significant performance degradation reported',
+        description: 'Users are reporting severe slowness on {ci}. Response times are 5-10x above normal thresholds. Root cause investigation in progress.',
+        impact:      '2',
+        urgency:     '2'
+    },
+    {
+        category:    'Software',
+        subcategory: 'Authentication',
+        shortDesc:   '{ci} — Authentication failures impacting subset of users',
+        description: 'A subset of users are unable to authenticate to {ci}. Error logs show repeated token validation failures. Identity provider connectivity being investigated.',
+        impact:      '2',
+        urgency:     '2'
+    },
+    {
+        category:    'Network',
+        subcategory: 'Connectivity',
+        shortDesc:   '{ci} — Intermittent connectivity drops reported',
+        description: 'Multiple users reporting intermittent connection drops to {ci}. Packet loss detected on primary link. Failover path operating at reduced capacity.',
+        impact:      '2',
+        urgency:     '2'
+    },
+
+    // Moderate / P3
+    {
+        category:    'Software',
+        subcategory: 'Application',
+        shortDesc:   '{ci} — Scheduled job failures detected',
+        description: 'Automated scheduled jobs on {ci} are failing intermittently. Manual intervention required to re-trigger. Root cause believed to be resource contention.',
+        impact:      '2',
+        urgency:     '3'
+    },
+    {
+        category:    'Software',
+        subcategory: 'Monitoring',
+        shortDesc:   '{ci} — Monitoring alerts not firing as expected',
+        description: 'Alerting rules for {ci} are not triggering as configured. Monitoring agent health check failed. Manual observation in place as workaround.',
+        impact:      '3',
+        urgency:     '2'
+    },
+    {
+        category:    'Hardware',
+        subcategory: 'Compute',
+        shortDesc:   '{ci} — Elevated CPU utilisation sustained over threshold',
+        description: 'CPU utilisation on {ci} has been above 90% for over 2 hours. No immediate user impact but trending toward saturation. Capacity team notified.',
+        impact:      '2',
+        urgency:     '3'
+    },
+
+    // Low / P4
+    {
+        category:    'Software',
+        subcategory: 'Application',
+        shortDesc:   '{ci} — Minor UI rendering issue reported by single user',
+        description: 'A single user has reported a cosmetic UI rendering issue on {ci}. No functional impact. Confirmed not reproducible in other browsers. Under investigation.',
+        impact:      '3',
+        urgency:     '3'
+    },
+    {
+        category:    'Software',
+        subcategory: 'Logging',
+        shortDesc:   '{ci} — Log rotation failure causing disk growth',
+        description: 'Log rotation scripts on {ci} failed to execute during the last maintenance cycle. Disk usage growing slowly. Manual cleanup performed as interim fix.',
+        impact:      '3',
+        urgency:     '3'
+    },
+    {
+        category:    'Software',
+        subcategory: 'Documentation',
+        shortDesc:   '{ci} — Outdated runbook linked in service portal',
+        description: 'The support runbook linked for {ci} in the service portal is outdated. Agents are referencing incorrect procedures. Updated version being prepared.',
+        impact:      '3',
+        urgency:     '4'
+    }
+];
+
+// Resolution notes pool (for Resolved state)
+var RESOLUTION_NOTES = [
+    'Root cause identified as a misconfigured service parameter. Configuration corrected and service verified as stable. Monitoring in place.',
+    'Issue traced to a failed background process consuming excess resources. Process restarted and health confirmed. Preventive alert added.',
+    'Vendor confirmed a platform-side defect. Patch applied by vendor. Service validated by operations and handed back to business.',
+    'Network path flap resolved after replacing a degraded switch port. Redundancy confirmed restored. User impact period: approximately 45 minutes.',
+    'Authentication issue resolved by clearing stale session cache and restarting the identity provider connector. All users confirmed able to log in.',
+    'Database connection pool exhaustion confirmed as root cause. Pool limits increased and query optimisation applied. Performance back within SLA.',
+    'Certificate mismatch found after a recent deployment. Correct certificate redeployed. SSL handshake failures ceased immediately post-fix.'
+];
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function offsetNow(offsetMs) {
+    var gdt = new GlideDateTime();
+    gdt.setNumericValue(gdt.getNumericValue() + offsetMs);
+    return gdt;
+}
+
+var minMs  = 60 * 1000;
+var hrMs   = 60 * minMs;
+var dayMs  = 24 * hrMs;
+
+/**
+ * Build contextually correct timestamps per incident state.
+ *
+ *  New          — opened 5 min – 4 hrs ago
+ *  In Progress  — opened 1 – 24 hrs ago
+ *  On Hold      — opened 6 hrs – 3 days ago, put on hold recently
+ *  Resolved     — opened 1 – 7 days ago, resolved 1 hr – 2 days ago
+ */
+function buildTimings(stateVal) {
+    var t = {};
+
+    if (stateVal === '1') {                      // New
+        t.opened   = offsetNow(-randInt(5 * minMs,  4 * hrMs));
+        t.resolved = null;
+
+    } else if (stateVal === '2') {               // In Progress
+        t.opened   = offsetNow(-randInt(1 * hrMs,  24 * hrMs));
+        t.resolved = null;
+
+    } else if (stateVal === '3') {               // On Hold
+        t.opened   = offsetNow(-randInt(6 * hrMs,   3 * dayMs));
+        t.resolved = null;
+
+    } else if (stateVal === '6') {               // Resolved
+        var resolvedAgo = randInt(1 * hrMs, 2 * dayMs);
+        var openedAgo   = resolvedAgo + randInt(30 * minMs, 5 * dayMs);
+        t.opened        = offsetNow(-openedAgo);
+        t.resolved      = offsetNow(-resolvedAgo);
+    }
+
+    return t;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LOOK UP CIs
+// ─────────────────────────────────────────────────────────────
+
+function resolveCIs(nameList) {
+    var resolved = {};
+    for (var i = 0; i < nameList.length; i++) {
+        var ciName = nameList[i];
+        var gr = new GlideRecord(CONFIG.ciTable);
+        gr.addQuery('name', ciName);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            resolved[ciName] = gr.getUniqueValue();
+            gs.log('CI found: "' + ciName + '" → sys_id ' + resolved[ciName], 'DemoIncidentGen');
+        } else {
+            gs.logWarning('CI NOT FOUND: "' + ciName + '" in table ' + CONFIG.ciTable + ' — skipping.', 'DemoIncidentGen');
+        }
+    }
+    return resolved;
+}
+
+// ─────────────────────────────────────────────────────────────
+// INSERT ONE INCIDENT
+// ─────────────────────────────────────────────────────────────
+
+function insertIncident(ciSysId, ciName, slot, tmpl, idx) {
+
+    var priority  = slot.priority || pick(slot.priorityPool);
+    var timings   = buildTimings(slot.state);
+    var shortDesc = tmpl.shortDesc.replace(/\{ci\}/g, ciName);
+    var descBody  = tmpl.description.replace(/\{ci\}/g, ciName);
+    var holdReason = (slot.state === '3') ? pick(HOLD_REASONS) : null;
+    var resolutionNote = slot.resolvedAt ? pick(RESOLUTION_NOTES) : null;
+
+    var PRIORITY_LABELS = { '1': 'Critical', '2': 'High', '3': 'Moderate', '4': 'Low' };
+    var STATE_LABELS    = { '1': 'New', '2': 'In Progress', '3': 'On Hold', '6': 'Resolved' };
+
+    if (CONFIG.logResults) {
+        gs.log(
+            '  [' + (idx + 1) + '] ' + STATE_LABELS[slot.state] +
+            ' | P' + priority + ' ' + PRIORITY_LABELS[priority] +
+            ' | Cat: ' + tmpl.category +
+            ' | "' + shortDesc + '"',
+            'DemoIncidentGen'
+        );
+    }
+
+    if (CONFIG.dryRun) { return true; }
+
+    try {
+        var gr = new GlideRecord('incident');
+        gr.initialize();
+
+        gr.setValue('cmdb_ci',           ciSysId);
+        gr.setValue('state',             slot.state);
+        gr.setValue('priority',          priority);
+        gr.setValue('impact',            tmpl.impact);
+        gr.setValue('urgency',           tmpl.urgency);
+        gr.setValue('category',          tmpl.category);
+        gr.setValue('subcategory',       tmpl.subcategory);
+        gr.setValue('short_description', shortDesc);
+        gr.setValue('description',       descBody);
+        gr.setValue('opened_at',         timings.opened);
+        gr.setValue('sys_created_on',    timings.opened);
+
+        if (holdReason) {
+            gr.setValue('hold_reason', holdReason);
+        }
+
+        if (timings.resolved) {
+            gr.setValue('resolved_at',    timings.resolved);
+            gr.setValue('close_notes',    resolutionNote);
+            gr.setValue('resolved_by',    gs.getUserID());
+        }
+
+        gr.insert();
+        return true;
+
+    } catch (ex) {
+        gs.logError('Failed to insert incident for "' + ciName + '": ' + ex.message, 'DemoIncidentGen');
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+
+gs.log('=== Demo Incident Generator START (' +
+    (CONFIG.dryRun ? 'DRY RUN' : 'LIVE') + ') ===', 'DemoIncidentGen');
+
+// Shuffle template array for variety across CIs
+function shuffled(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+}
+
+var ciMap       = resolveCIs(CI_NAMES);
+var totalInsert = 0;
+var totalSkip   = 0;
+var totalError  = 0;
+
+for (var ciName in ciMap) {
+    var ciSysId   = ciMap[ciName];
+    var templates = shuffled(INCIDENT_TEMPLATES);
+
+    gs.log('--- Generating incidents for: "' + ciName + '" ---', 'DemoIncidentGen');
+
+    // Slot 0 always uses a Critical/P1 template (first 3 templates are P1-worthy)
+    var criticalTmpl = pick(INCIDENT_TEMPLATES.slice(0, 3));
+
+    for (var s = 0; s < INCIDENT_SLOTS.length; s++) {
+        var slot = INCIDENT_SLOTS[s];
+        var tmpl = (s === 0) ? criticalTmpl : templates[s % templates.length];
+        var ok   = insertIncident(ciSysId, ciName, slot, tmpl, s);
+
+        if (CONFIG.dryRun) { totalSkip++; }
+        else if (ok)        { totalInsert++; }
+        else                { totalError++; }
+    }
+}
+
+// ── Summary ──────────────────────────────────────────────────
+gs.log('=== Demo Incident Generator COMPLETE ===', 'DemoIncidentGen');
+gs.log('CIs processed    : ' + Object.keys(ciMap).length + ' of ' + CI_NAMES.length, 'DemoIncidentGen');
+gs.log('Records inserted : ' + totalInsert, 'DemoIncidentGen');
+gs.log('Records skipped  : ' + totalSkip + (CONFIG.dryRun ? ' (dry run)' : ''), 'DemoIncidentGen');
+gs.log('Errors           : ' + totalError, 'DemoIncidentGen');
