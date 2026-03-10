@@ -1,358 +1,432 @@
 /**
- * ServiceNow Background Script: Generate Demo Raw Events
- * 
- * Purpose: Inserts sample raw events into the em_event table for
- *          demonstrating Event Management capabilities.
- * 
+ * ServiceNow Background Script: Generate Demo Event Management Records
+ *
+ * Purpose: Creates 5 em_event records per CI in the target list,
+ *          distributed across a realistic range of severities, with at
+ *          least 1 Critical severity event guaranteed per CI.
+ *
+ *   Slot distribution (5 per CI):
+ *   [1]  Critical   — severity: 6  GUARANTEED per CI
+ *   [2]  Major      — severity: 5
+ *   [3]  Minor      — severity: 4  (random within 3-4)
+ *   [4]  Warning    — severity: 3  (random within 2-3)
+ *   [5]  Clear      — severity: 1  (event resolved / self-healed)
+ *
  * Instructions:
  *   1. Navigate to System Definition > Scripts - Background
  *   2. Paste this script and click "Run script"
- *   3. Optionally adjust CONFIG values before running
- * 
+ *   3. Adjust CONFIG values if needed before running
+ *
  * Compatible with: ServiceNow Rome / San Diego / Tokyo / Utah / Vancouver+
+ *
+ * ServiceNow em_event severity values (OOTB):
+ *   1 = Clear   2 = Indeterminate   3 = Warning
+ *   4 = Minor   5 = Major           6 = Critical
+ *
+ * Event type values (em_event.type — free text / choice list):
+ *   Common values: CPU, Memory, Disk, Network, Application,
+ *                  Database, Security, Availability
  */
 
 // ─────────────────────────────────────────────────────────────
-// CONFIG — adjust these before running
+// CONFIG
 // ─────────────────────────────────────────────────────────────
 var CONFIG = {
-    dryRun: false,          // true = log only, no DB inserts
-    logResults: true,       // print each event to the log
-    eventCount: 20,         // how many events to generate
-    timeSpreadMinutes: 60   // spread events across this many minutes in the past
+    dryRun:            false,    // true = log only, no DB inserts
+    logResults:        true,     // print each record to the system log
+    ciTable:           'cmdb_ci' // table to look up CIs in
 };
 
 // ─────────────────────────────────────────────────────────────
-// EVENT TEMPLATES
-// Each template can produce multiple realistic variations
+// TARGET CI LIST  (matched on the 'name' field in cmdb_ci)
+// Add or remove CIs here — the rest of the script needs no changes
 // ─────────────────────────────────────────────────────────────
-var EVENT_TEMPLATES = [
+var CI_NAMES = [
+    'Amazon Web Services',
+    'WelcoMe AU'
+];
 
-    // ── Infrastructure / Server ──────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// EVENT SLOT DEFINITIONS
+// 5 slots per CI — severity is fixed or pooled per slot
+// ─────────────────────────────────────────────────────────────
+var EVENT_SLOTS = [
     {
-        source: 'SolarWinds',
-        type: 'CPU',
-        resource: 'CPU Utilization',
-        nodes: ['vmpdcoaaew015', 'AUSDCOAAEW001', 'vmpcsfaaew003', 'VMPCAPAAEW003'],
-        severities: [3, 4, 5],   // 1=Clear 2=Info 3=Warning 4=Minor 5=Major 6=Critical
-        messageTemplate: 'CPU utilization on {node} is at {value}% (threshold: {threshold}%)',
-        values: [78, 85, 91, 95, 98],
-        thresholds: [75, 80, 90],
-        metricName: 'cpu_utilization'
+        label:        'Critical',
+        severity:     6,          // Forced — guaranteed per CI
+        severityPool: null
     },
     {
-        source: 'SolarWinds',
-        type: 'Memory',
-        resource: 'Memory Utilization',
-        nodes: ['Laptop', 'INBLRB5MW824', '3C7R264 - Dell Inc. Dell Pro 14 Plus PB14250'],
-        severities: [3, 4, 5],
-        messageTemplate: 'Memory utilization on {node} is at {value}% (threshold: {threshold}%)',
-        values: [80, 88, 93, 97],
-        thresholds: [80, 85, 90],
-        metricName: 'memory_utilization'
+        label:        'Major',
+        severity:     5,          // Fixed Major
+        severityPool: null
     },
     {
-        source: 'SolarWinds',
-        type: 'Disk',
-        resource: 'Disk Space',
-        nodes: ['prod-db-01', 'prod-file-01', 'prod-backup-01'],
-        severities: [4, 5, 6],
-        messageTemplate: 'Disk space on {node} ({mount}) is {value}% full (threshold: {threshold}%)',
-        values: [85, 90, 95, 99],
-        thresholds: [85, 90, 95],
-        extraTokens: { mount: ['/data', '/var', '/opt', '/backup'] },
-        metricName: 'disk_utilization'
+        label:        'Minor / Warning',
+        severity:     null,
+        severityPool: [3, 4]      // Randomly Minor or Warning
     },
     {
-        source: 'SolarWinds',
-        type: 'Node Down',
-        resource: 'Node Availability',
-        nodes: ['prod-web-02', 'prod-cache-01', 'dev-app-03'],
-        severities: [6],
-        messageTemplate: 'Node {node} is unreachable. ICMP ping failed after {value} retries.',
-        values: [3, 5],
-        thresholds: [1],
-        metricName: 'node_availability'
-    },
-
-    // ── Network ──────────────────────────────────────────────
-    {
-        source: 'Cisco DNA Center',
-        type: 'Interface',
-        resource: 'Interface Errors',
-        nodes: ['core-sw-01', 'core-sw-02', 'dist-sw-05'],
-        severities: [3, 4, 5],
-        messageTemplate: 'High error rate detected on {node} interface {iface}: {value} errors/sec',
-        values: [120, 450, 1200, 3800],
-        thresholds: [100, 500, 1000],
-        extraTokens: { iface: ['GigabitEthernet0/1', 'TenGigabitEthernet1/0/1', 'GigabitEthernet0/24'] },
-        metricName: 'interface_error_rate'
+        label:        'Warning / Info',
+        severity:     null,
+        severityPool: [2, 3]      // Randomly Indeterminate or Warning
     },
     {
-        source: 'Cisco DNA Center',
-        type: 'BGP',
-        resource: 'BGP Session',
-        nodes: ['border-rtr-01', 'border-rtr-02'],
-        severities: [5, 6],
-        messageTemplate: 'BGP session down on {node} with peer {peer}. AS Path: {value}',
-        values: ['65001', '65002', '65100'],
-        thresholds: ['N/A'],
-        extraTokens: { peer: ['10.0.0.1', '10.0.0.2', '192.168.100.1'] },
-        metricName: 'bgp_session_state'
-    },
-    {
-        source: 'Cisco DNA Center',
-        type: 'Bandwidth',
-        resource: 'WAN Bandwidth',
-        nodes: ['wan-rtr-01', 'wan-rtr-02'],
-        severities: [3, 4],
-        messageTemplate: 'WAN link utilization on {node} is {value}% — approaching capacity',
-        values: [82, 87, 92],
-        thresholds: [80, 90],
-        metricName: 'wan_utilization'
-    },
-
-    // ── Application / Middleware ─────────────────────────────
-    {
-        source: 'AppDynamics',
-        type: 'Response Time',
-        resource: 'Application Response Time',
-        nodes: ['checkout-service', 'auth-service', 'inventory-api'],
-        severities: [3, 4, 5],
-        messageTemplate: 'Response time for {node} degraded to {value}ms (SLA threshold: {threshold}ms)',
-        values: [1200, 2500, 5000, 8000],
-        thresholds: [500, 1000, 2000],
-        metricName: 'response_time_ms'
-    },
-    {
-        source: 'AppDynamics',
-        type: 'Error Rate',
-        resource: 'Application Error Rate',
-        nodes: ['payment-service', 'order-service', 'user-service'],
-        severities: [4, 5, 6],
-        messageTemplate: 'Error rate for {node} is {value}% — exceeds threshold of {threshold}%',
-        values: [5.2, 10.8, 18.5, 25.0],
-        thresholds: [2, 5, 10],
-        metricName: 'error_rate_percent'
-    },
-    {
-        source: 'AppDynamics',
-        type: 'JVM Heap',
-        resource: 'JVM Heap Memory',
-        nodes: ['java-app-01', 'java-app-02', 'java-mq-01'],
-        severities: [4, 5],
-        messageTemplate: 'JVM heap memory on {node} is {value}% utilized — GC pressure detected',
-        values: [85, 90, 95],
-        thresholds: [80, 90],
-        metricName: 'jvm_heap_percent'
-    },
-
-    // ── Database ─────────────────────────────────────────────
-    {
-        source: 'OracleEM',
-        type: 'Tablespace',
-        resource: 'Oracle Tablespace',
-        nodes: ['prod-db-01', 'prod-db-02'],
-        severities: [4, 5, 6],
-        messageTemplate: 'Tablespace {tablespace} on {node} is {value}% full (autoextend disabled)',
-        values: [88, 93, 97, 99],
-        thresholds: [85, 90, 95],
-        extraTokens: { tablespace: ['USERS', 'SYSTEM', 'SYSAUX', 'APP_DATA', 'UNDO'] },
-        metricName: 'tablespace_utilization'
-    },
-    {
-        source: 'OracleEM',
-        type: 'Connection Pool',
-        resource: 'DB Connections',
-        nodes: ['prod-db-01'],
-        severities: [3, 5],
-        messageTemplate: 'Database connection pool on {node} at {value}% capacity ({threshold} max connections)',
-        values: [80, 91, 96],
-        thresholds: [150, 200, 300],
-        metricName: 'db_connection_percent'
-    },
-
-    // ── Cloud / Virtualization ───────────────────────────────
-    {
-        source: 'AWS CloudWatch',
-        type: 'EC2 CPU',
-        resource: 'EC2 CPU Credit',
-        nodes: ['i-0a1b2c3d4e5f6g7h8', 'i-1b2c3d4e5f6g7h8i9'],
-        severities: [4, 5],
-        messageTemplate: 'EC2 instance {node} CPU credit balance at {value} — throttling imminent',
-        values: [5, 2, 1],
-        thresholds: [10, 5],
-        metricName: 'cpu_credit_balance'
-    },
-    {
-        source: 'AWS CloudWatch',
-        type: 'RDS Storage',
-        resource: 'RDS Free Storage',
-        nodes: ['prod-rds-mysql-01', 'prod-rds-pg-01'],
-        severities: [4, 5, 6],
-        messageTemplate: 'RDS instance {node} free storage at {value}GB — approaching minimum threshold',
-        values: [8, 4, 2, 1],
-        thresholds: [10, 5, 2],
-        metricName: 'rds_free_storage_gb'
-    },
-
-    // ── Security ─────────────────────────────────────────────
-    {
-        source: 'Splunk SIEM',
-        type: 'Authentication',
-        resource: 'Failed Login Attempts',
-        nodes: ['vpn-gw-01', 'ad-dc-01', 'jumphost-01'],
-        severities: [4, 5, 6],
-        messageTemplate: 'Brute force detected on {node}: {value} failed login attempts in 5 minutes from {ip}',
-        values: [50, 120, 350, 800],
-        thresholds: [20, 50, 100],
-        extraTokens: { ip: ['192.168.1.55', '10.10.0.99', '172.16.5.12', '203.0.113.42'] },
-        metricName: 'failed_auth_count'
+        label:        'Clear (Self-healed)',
+        severity:     1,          // Clear — event resolved itself
+        severityPool: null
     }
 ];
 
 // ─────────────────────────────────────────────────────────────
-// HELPER UTILITIES
+// EVENT SOURCE / TYPE TEMPLATES
+// ─────────────────────────────────────────────────────────────
+var EVENT_TEMPLATES = [
+
+    // ── Availability ─────────────────────────────────────────
+    {
+        source:      'SolarWinds',
+        type:        'Availability',
+        resource:    'Service Availability',
+        messageTemplate: '{ci} is completely unavailable. All health checks failing. ICMP and TCP probes returning no response.',
+        additionalInfo:  { metric: 'availability_percent', value: 0, threshold: 99.9 }
+    },
+    {
+        source:      'SolarWinds',
+        type:        'Availability',
+        resource:    'Service Availability',
+        messageTemplate: '{ci} availability has dropped below SLA threshold. Partial service degradation detected across multiple regions.',
+        additionalInfo:  { metric: 'availability_percent', value: 94.2, threshold: 99.5 }
+    },
+
+    // ── CPU ──────────────────────────────────────────────────
+    {
+        source:      'AppDynamics',
+        type:        'CPU',
+        resource:    'CPU Utilisation',
+        messageTemplate: 'CPU utilisation on {ci} has reached critical levels. Sustained at {value}% for over 15 minutes — service impact imminent.',
+        additionalInfo:  { metric: 'cpu_utilization_percent', value: 97, threshold: 90 }
+    },
+    {
+        source:      'AppDynamics',
+        type:        'CPU',
+        resource:    'CPU Utilisation',
+        messageTemplate: 'Elevated CPU utilisation detected on {ci}. Current: {value}%. Trending upward — monitoring closely.',
+        additionalInfo:  { metric: 'cpu_utilization_percent', value: 82, threshold: 80 }
+    },
+
+    // ── Memory ───────────────────────────────────────────────
+    {
+        source:      'AppDynamics',
+        type:        'Memory',
+        resource:    'Memory Utilisation',
+        messageTemplate: 'Memory exhaustion detected on {ci}. Available memory below 2%. OOM kill risk is high.',
+        additionalInfo:  { metric: 'memory_utilization_percent', value: 98, threshold: 90 }
+    },
+    {
+        source:      'AppDynamics',
+        type:        'Memory',
+        resource:    'Memory Utilisation',
+        messageTemplate: 'Memory utilisation on {ci} is elevated at {value}%. Garbage collection pressure increasing.',
+        additionalInfo:  { metric: 'memory_utilization_percent', value: 85, threshold: 80 }
+    },
+
+    // ── Network ──────────────────────────────────────────────
+    {
+        source:      'Cisco DNA Center',
+        type:        'Network',
+        resource:    'Network Connectivity',
+        messageTemplate: 'Network connectivity failure detected for {ci}. Primary and secondary uplinks are both down. Failover not available.',
+        additionalInfo:  { metric: 'link_state', value: 'down', threshold: 'up' }
+    },
+    {
+        source:      'Cisco DNA Center',
+        type:        'Network',
+        resource:    'Packet Loss',
+        messageTemplate: 'High packet loss detected on {ci} network path. Current loss: {value}%. Application performance severely impacted.',
+        additionalInfo:  { metric: 'packet_loss_percent', value: 22, threshold: 1 }
+    },
+    {
+        source:      'Cisco DNA Center',
+        type:        'Network',
+        resource:    'Latency',
+        messageTemplate: 'Network latency for {ci} exceeding acceptable threshold. Round-trip time: {value}ms (threshold: 50ms).',
+        additionalInfo:  { metric: 'rtt_ms', value: 210, threshold: 50 }
+    },
+
+    // ── Storage / Disk ───────────────────────────────────────
+    {
+        source:      'SolarWinds',
+        type:        'Disk',
+        resource:    'Disk Space',
+        messageTemplate: 'Disk space on {ci} critically low. Volume at {value}% capacity. Write failures may occur imminently.',
+        additionalInfo:  { metric: 'disk_utilization_percent', value: 98, threshold: 90 }
+    },
+    {
+        source:      'SolarWinds',
+        type:        'Disk',
+        resource:    'Disk Space',
+        messageTemplate: 'Disk utilisation on {ci} approaching threshold. Currently at {value}% — action required before saturation.',
+        additionalInfo:  { metric: 'disk_utilization_percent', value: 86, threshold: 85 }
+    },
+
+    // ── Application ──────────────────────────────────────────
+    {
+        source:      'AppDynamics',
+        type:        'Application',
+        resource:    'Response Time',
+        messageTemplate: 'Application response time for {ci} has degraded critically. P95 latency: {value}ms (SLA: 500ms). User experience severely impacted.',
+        additionalInfo:  { metric: 'response_time_p95_ms', value: 8200, threshold: 500 }
+    },
+    {
+        source:      'AppDynamics',
+        type:        'Application',
+        resource:    'Error Rate',
+        messageTemplate: 'Error rate for {ci} has spiked to {value}%. Transactions are failing at an unacceptable rate. Immediate investigation required.',
+        additionalInfo:  { metric: 'error_rate_percent', value: 28.5, threshold: 5 }
+    },
+    {
+        source:      'AppDynamics',
+        type:        'Application',
+        resource:    'Throughput',
+        messageTemplate: 'Transaction throughput for {ci} has dropped to {value} TPS — {drop}% below baseline. Upstream dependency issue suspected.',
+        additionalInfo:  { metric: 'throughput_tps', value: 12, threshold: 80 }
+    },
+
+    // ── Database ─────────────────────────────────────────────
+    {
+        source:      'OracleEM',
+        type:        'Database',
+        resource:    'DB Connections',
+        messageTemplate: 'Database connection pool for {ci} is exhausted. All {value} connections in use. New requests are being rejected.',
+        additionalInfo:  { metric: 'db_connections_used', value: 300, threshold: 280 }
+    },
+    {
+        source:      'OracleEM',
+        type:        'Database',
+        resource:    'Tablespace',
+        messageTemplate: 'Database tablespace on {ci} is {value}% full. Autoextend is disabled. Inserts will fail if not addressed immediately.',
+        additionalInfo:  { metric: 'tablespace_utilization_percent', value: 97, threshold: 90 }
+    },
+
+    // ── Security ─────────────────────────────────────────────
+    {
+        source:      'Splunk SIEM',
+        type:        'Security',
+        resource:    'Authentication',
+        messageTemplate: 'Brute force attack detected against {ci}. {value} failed authentication attempts in 10 minutes from external IP ranges.',
+        additionalInfo:  { metric: 'failed_auth_count', value: 842, threshold: 50 }
+    },
+    {
+        source:      'Splunk SIEM',
+        type:        'Security',
+        resource:    'Anomaly Detection',
+        messageTemplate: 'Anomalous data egress pattern detected from {ci}. Volume significantly above baseline — potential data exfiltration.',
+        additionalInfo:  { metric: 'egress_bytes', value: 4800000000, threshold: 500000000 }
+    },
+
+    // ── Clear / Self-heal ────────────────────────────────────
+    {
+        source:      'SolarWinds',
+        type:        'Availability',
+        resource:    'Service Availability',
+        messageTemplate: '{ci} health checks are now passing. Service availability restored to normal levels. Previous alert condition cleared.',
+        additionalInfo:  { metric: 'availability_percent', value: 100, threshold: 99.9 }
+    },
+    {
+        source:      'AppDynamics',
+        type:        'CPU',
+        resource:    'CPU Utilisation',
+        messageTemplate: 'CPU utilisation on {ci} has returned within normal thresholds. Current: {value}%. Alert condition cleared.',
+        additionalInfo:  { metric: 'cpu_utilization_percent', value: 45, threshold: 90 }
+    }
+];
+
+// ─────────────────────────────────────────────────────────────
+// SEVERITY LABEL MAP  (for logging)
+// ─────────────────────────────────────────────────────────────
+var SEVERITY_LABELS = {
+    1: 'CLEAR',
+    2: 'INDETERMINATE',
+    3: 'WARNING',
+    4: 'MINOR',
+    5: 'MAJOR',
+    6: 'CRITICAL'
+};
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
 // ─────────────────────────────────────────────────────────────
 
-/** Pick a random element from an array */
 function pick(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
 }
 
-/** Resolve a token that may be a value or an array */
-function resolveToken(val) {
-    return Array.isArray(val) ? pick(val) : val;
+function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-/** Return a GlideDateTime offset back by a random number of minutes */
-function randomPastTime(maxMinutesAgo) {
+function offsetNow(offsetMs) {
     var gdt = new GlideDateTime();
-    var offsetMs = Math.floor(Math.random() * maxMinutesAgo * 60 * 1000);
-    gdt.setNumericValue(gdt.getNumericValue() - offsetMs);
+    gdt.setNumericValue(gdt.getNumericValue() + offsetMs);
     return gdt;
 }
 
-/** Build the message string from a template, replacing {tokens} */
-function buildMessage(template, tokens) {
-    var msg = template;
-    for (var key in tokens) {
-        msg = msg.replace(new RegExp('{' + key + '}', 'g'), tokens[key]);
+var minMs = 60 * 1000;
+var hrMs  = 60 * minMs;
+var dayMs = 24 * hrMs;
+
+/**
+ * Build a realistic time_of_event for each severity level.
+ *   Critical / Major  — very recent (1 – 60 min ago)
+ *   Minor / Warning   — somewhat recent (30 min – 12 hrs ago)
+ *   Clear             — recent enough to follow a prior alert (5 – 90 min ago)
+ */
+function buildEventTime(severity) {
+    if (severity === 6 || severity === 5) {
+        return offsetNow(-randInt(1 * minMs, 60 * minMs));
+    } else if (severity === 4 || severity === 3) {
+        return offsetNow(-randInt(30 * minMs, 12 * hrMs));
+    } else if (severity === 2) {
+        return offsetNow(-randInt(1 * hrMs, 24 * hrMs));
+    } else {
+        // Clear
+        return offsetNow(-randInt(5 * minMs, 90 * minMs));
+    }
+}
+
+/** Replace {ci} and {value}/{drop} tokens in message template */
+function buildMessage(template, ciName, addlInfo) {
+    var msg = template.replace(/\{ci\}/g, ciName);
+    if (addlInfo && addlInfo.value !== undefined) {
+        msg = msg.replace(/\{value\}/g, addlInfo.value);
+    }
+    if (addlInfo && addlInfo.drop !== undefined) {
+        msg = msg.replace(/\{drop\}/g, addlInfo.drop);
+    } else {
+        msg = msg.replace(/\{drop\}/g, randInt(50, 85));
     }
     return msg;
 }
 
-/** Map numeric severity to ServiceNow em_event severity string */
-function severityLabel(num) {
-    var map = { 1: 'clear', 2: 'info', 3: 'warning', 4: 'minor', 5: 'major', 6: 'critical' };
-    return map[num] || 'warning';
-}
-
 // ─────────────────────────────────────────────────────────────
-// EVENT GENERATOR
+// LOOK UP CIs
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Build one event record object from a randomly chosen template.
- */
-function generateEvent() {
-    var tmpl    = pick(EVENT_TEMPLATES);
-    var node    = pick(tmpl.nodes);
-    var sev     = pick(tmpl.severities);
-    var value   = resolveToken(tmpl.values);
-    var thresh  = resolveToken(tmpl.thresholds);
-
-    // Build token map for message substitution
-    var tokens = {
-        node:      node,
-        value:     value,
-        threshold: thresh
-    };
-
-    // Merge any extra token arrays defined in the template
-    if (tmpl.extraTokens) {
-        for (var k in tmpl.extraTokens) {
-            tokens[k] = pick(tmpl.extraTokens[k]);
+function resolveCIs(nameList) {
+    var resolved = {};
+    for (var i = 0; i < nameList.length; i++) {
+        var ciName = nameList[i];
+        var gr = new GlideRecord(CONFIG.ciTable);
+        gr.addQuery('name', ciName);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            resolved[ciName] = gr.getUniqueValue();
+            gs.log('CI found: "' + ciName + '" → sys_id ' + resolved[ciName], 'DemoEventGen');
+        } else {
+            gs.logWarning('CI NOT FOUND: "' + ciName + '" in table ' + CONFIG.ciTable + ' — skipping.', 'DemoEventGen');
         }
     }
-
-    var message = buildMessage(tmpl.messageTemplate, tokens);
-
-    // additional_info as a JSON string — useful for alert rules / parsing
-    var additionalInfo = JSON.stringify({
-        metric_name:  tmpl.metricName,
-        metric_value: value,
-        threshold:    thresh,
-        source_host:  node,
-        datacenter:   pick(['DC-East', 'DC-West', 'DC-Central']),
-        environment:  pick(['Production', 'Production', 'Staging', 'DR'])  // prod weighted
-    });
-
-    return {
-        source:          tmpl.source,
-        event_class:     tmpl.type,
-        resource:        tmpl.resource,
-        node:            node,
-        severity:        sev,
-        description:     message,
-        additional_info: additionalInfo,
-        time_of_event:   randomPastTime(CONFIG.timeSpreadMinutes),
-        type:            tmpl.type
-    };
+    return resolved;
 }
 
 // ─────────────────────────────────────────────────────────────
-// MAIN — insert events into em_event
+// INSERT ONE EVENT
 // ─────────────────────────────────────────────────────────────
 
-var inserted = 0;
-var skipped  = 0;
-var errors   = [];
+function insertEvent(ciSysId, ciName, slot, tmpl, idx) {
 
-gs.log('=== Demo Event Generator START (' +
+    var severity    = (slot.severity !== null) ? slot.severity : pick(slot.severityPool);
+    var eventTime   = buildEventTime(severity);
+    var message     = buildMessage(tmpl.messageTemplate, ciName, tmpl.additionalInfo);
+    var addlInfoStr = JSON.stringify(
+        gs.extend(tmpl.additionalInfo || {}, {
+            ci_name:     ciName,
+            environment: pick(['Production', 'Production', 'Staging', 'DR']),
+            datacenter:  pick(['DC-East', 'DC-West', 'DC-Central'])
+        })
+    );
+
+    if (CONFIG.logResults) {
+        gs.log(
+            '  [' + (idx + 1) + '] ' + SEVERITY_LABELS[severity] +
+            ' | Source: ' + tmpl.source +
+            ' | Type: '   + tmpl.type +
+            ' | Node: '   + ciName +
+            ' | ' + message.substring(0, 80) + (message.length > 80 ? '...' : ''),
+            'DemoEventGen'
+        );
+    }
+
+    if (CONFIG.dryRun) { return true; }
+
+    try {
+        var gr = new GlideRecord('em_event');
+        gr.initialize();
+        gr.setValue('source',          tmpl.source);
+        gr.setValue('event_class',     tmpl.type);
+        gr.setValue('resource',        tmpl.resource);
+        gr.setValue('node',            ciName);
+        gr.setValue('ci',              ciSysId);
+        gr.setValue('severity',        severity);
+        gr.setValue('description',     message);
+        gr.setValue('additional_info', addlInfoStr);
+        gr.setValue('time_of_event',   eventTime);
+        gr.setValue('type',            tmpl.type);
+        gr.insert();
+        return true;
+
+    } catch (ex) {
+        gs.logError('Failed to insert event for "' + ciName + '": ' + ex.message, 'DemoEventGen');
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+
+gs.log('=== Demo Event Management Generator START (' +
     (CONFIG.dryRun ? 'DRY RUN' : 'LIVE') + ') ===', 'DemoEventGen');
 
-for (var i = 0; i < CONFIG.eventCount; i++) {
-    try {
-        var evt = generateEvent();
+function shuffled(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+}
 
-        if (CONFIG.logResults) {
-            gs.log(
-                '[' + (i + 1) + '/' + CONFIG.eventCount + '] ' +
-                severityLabel(evt.severity).toUpperCase() + ' | ' +
-                evt.source + ' | ' + evt.node + ' | ' + evt.description,
-                'DemoEventGen'
-            );
-        }
+var ciMap       = resolveCIs(CI_NAMES);
+var totalInsert = 0;
+var totalSkip   = 0;
+var totalError  = 0;
 
-        if (!CONFIG.dryRun) {
-            var gr = new GlideRecord('em_event');
-            gr.initialize();
-            gr.setValue('source',          evt.source);
-            gr.setValue('event_class',     evt.event_class);
-            gr.setValue('resource',        evt.resource);
-            gr.setValue('node',            evt.node);
-            gr.setValue('severity',        evt.severity);
-            gr.setValue('description',     evt.description);
-            gr.setValue('additional_info', evt.additional_info);
-            gr.setValue('time_of_event',   evt.time_of_event);
-            gr.setValue('type',            evt.type);
-            gr.insert();
-            inserted++;
-        } else {
-            skipped++;
-        }
-    } catch (ex) {
-        errors.push('Event ' + (i + 1) + ': ' + ex.message);
-        gs.logError('Failed to insert event ' + (i + 1) + ': ' + ex.message, 'DemoEventGen');
+for (var ciName in ciMap) {
+    var ciSysId   = ciMap[ciName];
+    var templates = shuffled(EVENT_TEMPLATES);
+
+    gs.log('--- Generating events for: "' + ciName + '" ---', 'DemoEventGen');
+
+    // Slot 0 always gets a high-impact template (first 4 are availability/outage level)
+    var criticalTmpl = pick(EVENT_TEMPLATES.slice(0, 4));
+
+    for (var s = 0; s < EVENT_SLOTS.length; s++) {
+        var slot = EVENT_SLOTS[s];
+        var tmpl = (s === 0) ? criticalTmpl : templates[s % templates.length];
+        var ok   = insertEvent(ciSysId, ciName, slot, tmpl, s);
+
+        if (CONFIG.dryRun) { totalSkip++; }
+        else if (ok)        { totalInsert++; }
+        else                { totalError++; }
     }
 }
 
 // ── Summary ──────────────────────────────────────────────────
-gs.log('=== Demo Event Generator COMPLETE ===', 'DemoEventGen');
-gs.log('Inserted : ' + inserted, 'DemoEventGen');
-gs.log('Skipped  : ' + skipped + (CONFIG.dryRun ? ' (dry run)' : ''), 'DemoEventGen');
-gs.log('Errors   : ' + errors.length, 'DemoEventGen');
-if (errors.length > 0) {
-    gs.log('Error details: ' + errors.join(' | '), 'DemoEventGen');
-}
+gs.log('=== Demo Event Management Generator COMPLETE ===', 'DemoEventGen');
+gs.log('CIs processed    : ' + Object.keys(ciMap).length + ' of ' + CI_NAMES.length, 'DemoEventGen');
+gs.log('Records inserted : ' + totalInsert, 'DemoEventGen');
+gs.log('Records skipped  : ' + totalSkip + (CONFIG.dryRun ? ' (dry run)' : ''), 'DemoEventGen');
+gs.log('Errors           : ' + totalError, 'DemoEventGen');
