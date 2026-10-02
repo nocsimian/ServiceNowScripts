@@ -1,0 +1,37 @@
+(function () {
+    var DRY_RUN       = true;               // set to false to actually delete
+    var IMPORT_SET_NO = '';                 // e.g. 'ISET0010234'; leave '' to use staging table + today
+    var STAGING_TABLE = 'u_your_import_set_table';  // used only if IMPORT_SET_NO is blank
+    var DELETE_ROWS   = false;              // also remove the staging rows afterwards
+
+    var rows = new GlideRecord('sys_import_set_row');
+    if (IMPORT_SET_NO) {
+        rows.addQuery('sys_import_set.number', IMPORT_SET_NO);
+    } else {
+        rows.addQuery('sys_import_set.table_name', STAGING_TABLE);
+        rows.addEncodedQuery('sys_import_set.sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+    }
+    rows.addQuery('sys_import_state', 'inserted');   // inserted only, never "updated" (those are pre-existing CIs)
+    rows.addNotNullQuery('sys_target_sys_id');
+    rows.query();
+
+    var counts = {}, total = 0, missing = 0;
+
+    while (rows.next()) {
+        var tbl = rows.getValue('sys_target_table');
+        var ci = new GlideRecord(tbl);
+        if (!ci.get(rows.getValue('sys_target_sys_id'))) { missing++; continue; }
+
+        var cls = ci.getValue('sys_class_name');
+        counts[cls] = (counts[cls] || 0) + 1;
+        total++;
+
+        if (!DRY_RUN) {
+            ci.deleteRecord();
+            if (DELETE_ROWS) rows.deleteRecord();
+        }
+    }
+
+    gs.info('Import set CI cleanup (' + (DRY_RUN ? 'DRY RUN' : 'DELETED') + ') - total: ' + total + ', already gone: ' + missing);
+    for (var c in counts) gs.info('  ' + c + ': ' + counts[c]);
+})();
